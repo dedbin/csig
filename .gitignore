@@ -1,0 +1,5 @@
+/projs
+csig.sqlite3
+__pycache__
+.vscode
+.pytest_cache
