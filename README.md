@@ -10,6 +10,7 @@
 ## Что умеет
 
 - Индексирует файлы с расширениями: `.c`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.h`, `.hh`, `.hpp`, `.hxx`.
+- Пропускает служебные и локальные каталоги вроде `.git`, `__pycache__`, `.pytest_cache`, `.venv`, `node_modules`, `projs`.
 - Хранит индекс в `SQLite` (по умолчанию `csig.sqlite3` в корне проекта).
 - Повторная индексация инкрементальная: неизмененные файлы (по `mtime + size`) пропускаются.
 - Поиск нечёткий: ранжирование по расстоянию Левенштейна для имени и нормализованной сигнатуры.
@@ -75,6 +76,12 @@ python csig.py search . "int (int, int)"
 python csig.py search . "add :: int (int, int)" --top 10
 ```
 
+Поиск с multiprocessing-ранжированием:
+
+```bash
+python csig.py search . "add :: int (int, int)" --top 10 --rank-processes 2
+```
+
 ### Интерактивный режим (TUI)
 
 ```bash
@@ -89,9 +96,18 @@ python csig.py tui .
 python csig.py index .
 python csig.py search . "add :: int (int, int)"
 python csig.py search . "int (const char *)"
+python csig.py search . "add :: int (int, int)" --rank-processes 2
 ```
 
 `search` перед запросом автоматически запускает обновление индекса, чтобы база была актуальной.
+Если нужно индексировать внешнюю локальную библиотеку из `projs`, запускайте ее как отдельный root, например `python csig.py index projs/raylib`.
+
+## Соответствие требованиям
+
+- ООП: основной сценарий обернут в класс `SignatureSearchEngine`, который хранит `root`, путь к SQLite-базе, число workers и предоставляет методы `index()` и `search()`.
+- Потоки: индексатор использует `threading` и `queue.Queue`: отдельный discovery-поток ищет файлы, worker-потоки парсят C/C++ через `libclang`, writer-поток обновляет SQLite.
+- Multiprocessing: команда `search` поддерживает `--rank-processes N`; при `N > 1` score кандидатов считается через `ProcessPoolExecutor`, а итоговая сортировка остается стабильной.
+- Графики: в текущую версию не добавлены, потому что задача проекта — локальный быстрый поиск по сигнатурам, и графики не улучшают основной пользовательский сценарий.
 
 ## Частые проблемы и решения
 
@@ -166,7 +182,8 @@ python -m pip install -r requirements.txt
 4. Кандидаты ранжируются по расстоянию Левенштейна:
    - `name` vs `query.name`
    - `signature_norm` vs `query.normalised_signature`
-5. Результаты сортируются по score, затем стабилизируются по имени/пути/позиции и обрезаются до `--top`.
+5. Если указан `--rank-processes N`, score кандидатов может считаться в нескольких процессах.
+6. Результаты сортируются по score, затем стабилизируются по имени/пути/позиции и обрезаются до `--top`.
 
 ### Формат вывода CLI
 
@@ -185,6 +202,7 @@ python csig.py --help
 python csig.py index --help
 python csig.py search --help
 python csig.py tui --help
+python csig.py search . "add :: int (int, int)" --rank-processes 2
 pytest -q
 ```
 

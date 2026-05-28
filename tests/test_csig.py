@@ -172,6 +172,83 @@ def test_rank_candidates_stable_top_n(tmp_path):
     assert top1[0]["name"] == top1_again[0]["name"]
 
 
+def test_rank_candidates_processes_match_sequential():
+    query = csig.Query(name="add", normalised_signature="int ( int , int )")
+    candidates = [
+        {
+            "id": 1,
+            "path": "b.c",
+            "name": "subtract",
+            "return_type": "int",
+            "params": [["int", "a"], ["int", "b"]],
+            "signature_norm": "int ( int , int )",
+            "line": 20,
+            "column": 1,
+        },
+        {
+            "id": 2,
+            "path": "a.c",
+            "name": "add",
+            "return_type": "int",
+            "params": [["int", "a"], ["int", "b"]],
+            "signature_norm": "int ( int , int )",
+            "line": 10,
+            "column": 1,
+        },
+    ]
+
+    sequential = csig.rank_candidates(candidates, query, top=2, processes=1)
+    parallel = csig.rank_candidates(candidates, query, top=2, processes=2)
+
+    assert [row["name"] for row in parallel] == [row["name"] for row in sequential]
+
+
+def test_signature_search_engine_index_uses_configured_paths(monkeypatch, tmp_path):
+    root = tmp_path / "src"
+    root.mkdir()
+    db_path = tmp_path / "idx.sqlite3"
+    calls = {}
+
+    def fake_run_index(root_arg, db_arg, workers, progress_cb=None):
+        calls["root"] = root_arg
+        calls["db_path"] = db_arg
+        calls["workers"] = workers
+        calls["has_progress"] = progress_cb is not None
+        return {
+            "root": root_arg,
+            "db_path": db_arg,
+            "workers": workers,
+            "files_total": 0,
+            "files_indexed": 0,
+            "files_skipped": 0,
+            "files_failed": 0,
+            "functions_total": 0,
+            "duration_seconds": 0.0,
+        }
+
+    monkeypatch.setattr(csig, "run_index", fake_run_index)
+    engine = csig.SignatureSearchEngine(str(root), db_path=str(db_path), workers=3)
+    summary = engine.index(progress_cb=lambda _snapshot: None)
+
+    assert calls["root"] == str(root.resolve())
+    assert calls["db_path"] == str(db_path.resolve())
+    assert calls["workers"] == 3
+    assert calls["has_progress"] is True
+    assert summary["workers"] == 3
+
+
+def test_search_filters_stale_candidates_from_skipped_dirs(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    active_path = root / "test.c"
+    skipped_path = root / "projs" / "raylib" / "src" / "raylib.c"
+    explicit_library_root = root / "projs" / "raylib"
+
+    assert csig._is_path_under_skipped_dir(str(root), str(active_path)) is False
+    assert csig._is_path_under_skipped_dir(str(root), str(skipped_path)) is True
+    assert csig._is_path_under_skipped_dir(str(explicit_library_root), str(skipped_path)) is False
+
+
 def test_indexer_skips_unchanged_files_by_mtime_and_size(tmp_path, monkeypatch):
     root = tmp_path / "src"
     root.mkdir()
@@ -194,6 +271,26 @@ def test_indexer_skips_unchanged_files_by_mtime_and_size(tmp_path, monkeypatch):
     assert second["files_total"] == 2
     assert second["files_skipped"] == 2
     assert second["files_indexed"] == 0
+
+
+def test_indexer_skips_local_project_corpus_by_default(tmp_path, monkeypatch):
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "test.c").write_text("int add(int a, int b){return a + b;}\n", encoding="utf-8")
+    local_corpus = root / "projs"
+    local_corpus.mkdir()
+    (local_corpus / "external.c").write_text("int external(void){return 0;}\n", encoding="utf-8")
+    db_path = tmp_path / "idx.sqlite3"
+
+    def fake_parse(path, mtime, size, index):
+        del mtime, size, index
+        return [_function_for_test(path, Path(path).stem)], None
+
+    monkeypatch.setattr(csig_indexer, "parse_source_file", fake_parse)
+    summary = csig_indexer.run_index(str(root), str(db_path), workers=1)
+
+    assert summary["files_total"] == 1
+    assert summary["files_indexed"] == 1
 
 
 def test_indexer_cancel_stops_processing_and_returns(tmp_path, monkeypatch):
@@ -224,3 +321,44 @@ def test_indexer_cancel_stops_processing_and_returns(tmp_path, monkeypatch):
 
     assert summary["canceled"] is True
     assert int(summary["files_done"]) < int(summary["files_total"])
+
+
+def test_cmd_index_verbose_prints_events(monkeypatch, capsys, tmp_path):
+    root = tmp_path / "src"
+    root.mkdir()
+
+    def fake_run_index(root, db_path, workers, progress_cb=None, cancel_event=None):
+        del root, db_path, workers, cancel_event
+        assert progress_cb is not None
+        progress_cb(
+            {
+                "files_total": 1,
+                "files_done": 1,
+                "files_indexed": 1,
+                "files_skipped": 0,
+                "files_failed": 0,
+                "last_file": "x.c",
+                "last_status": "indexed",
+            }
+        )
+        return {
+            "root": str(tmp_path),
+            "db_path": str(tmp_path / "idx.sqlite3"),
+            "workers": 1,
+            "files_total": 1,
+            "files_indexed": 1,
+            "files_skipped": 0,
+            "files_failed": 0,
+            "functions_total": 1,
+            "duration_seconds": 0.1,
+        }
+
+    monkeypatch.setattr(csig, "run_index", fake_run_index)
+    args = csig.build_parser().parse_args(["index", str(root), "--verbose", "--workers", "1"])
+
+    rc = args.handler(args)
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "indexed: x.c" in out
+    assert "Files indexed: 1" in out
