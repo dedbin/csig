@@ -27,6 +27,19 @@ ProgressCallback = Callable[[Dict[str, Any]], None]
 C_EXTENSIONS = {".c"}
 CPP_EXTENSIONS = {".cc", ".cpp", ".cxx", ".c++"}
 HEADER_EXTENSIONS = {".h", ".hh", ".hpp", ".hxx"}
+SKIPPED_DIRS = {
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "projs",
+    "venv",
+}
 
 
 def _clang_language_arg(language: str) -> str:
@@ -62,6 +75,8 @@ class _ProgressTracker:
             "canceled": False,
             "start_time": None,
             "end_time": None,
+            "last_file": None,
+            "last_status": None,
         }
         self._progress_cb = progress_cb
 
@@ -148,9 +163,10 @@ def _discover_files(
     tracker: _ProgressTracker,
 ) -> None:
     try:
-        for dirpath, _dirnames, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(root):
             if cancel_event.is_set():
                 break
+            dirnames[:] = [dirname for dirname in dirnames if dirname not in SKIPPED_DIRS]
             for filename in filenames:
                 if cancel_event.is_set():
                     break
@@ -169,6 +185,7 @@ def _discover_files(
 
                 old_state = known_states.get(file_path)
                 if old_state is not None and old_state == (mtime, size):
+                    tracker.set(last_file=file_path, last_status="skipped")
                     tracker.inc(files_skipped=1, files_done=1)
                     continue
 
@@ -264,11 +281,13 @@ def _writer_loop(
             file_id = get_or_create_file(db, path, mtime, size)
 
             if error:
+                tracker.set(last_file=path, last_status="failed")
                 mark_file_error(db, file_id=file_id, mtime=mtime, size=size, error=str(error))
                 db.commit()
                 tracker.inc(files_failed=1, files_done=1)
                 continue
 
+            tracker.set(last_file=path, last_status="indexed")
             replace_functions_for_file(db, file_id, functions)
             mark_file_parsed(db, file_id=file_id, mtime=mtime, size=size)
             db.commit()
